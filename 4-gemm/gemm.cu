@@ -21,7 +21,32 @@ __global__ void batch_gemm_kernel(int n, int batch_size,
                                     float* C)
 {
     // TODO: write your own kernel here
+    // Identification de la position du thread
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    int b   = blockIdx.z;
+
+    // Vérification des limites
+    if (row < n && col < n && b < batch_size)
+    {
+        size_t matrix_size = (size_t)n * n;
+        size_t base = (size_t)b * matrix_size;
+
+        float sum = 0.0f;
+
+        // Calcul du produit scalaire
+        for (int k = 0; k < n; ++k)
+        {
+            sum += A[base + (size_t)k * n + row]
+                 * B[base + (size_t)col * n + k];
+        }
+
+        // Stockage du résultat
+        C[base + (size_t)col * n + row] = sum;
+    }
 }
+
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // CPU reference implementation
@@ -149,10 +174,22 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     // TODO: write your allocations here
 
+    // Pointeurs vers la mémoire GPU
+    float *d_A = nullptr;
+    float *d_B = nullptr;
+    float *d_C = nullptr;
+
+    // Allocation de la mémoire GPU
+    cudaMalloc((void**)&d_A, bytes);
+    cudaMalloc((void**)&d_B, bytes);
+    cudaMalloc((void**)&d_C, bytes);
+
+
     // --------------------------------------------------------
     // Copy A and B to GPU
     // --------------------------------------------------------
-    // TODO: write your mem-copies here
+        cudaMemcpy(d_A, h_A.data(), bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_B, h_B.data(), bytes, cudaMemcpyHostToDevice);
 
     // --------------------------------------------------------
     // GPU information
@@ -175,62 +212,127 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     // CUDA events
     // --------------------------------------------------------
-    // TODO: create CUDA events for timing
+    // Création des événements CUDA
+      cudaEvent_t start, stop;
+
+      cudaEventCreate(&start);
+      cudaEventCreate(&stop);
 
     // --------------------------------------------------------
     // Custom kernel configuration
     // --------------------------------------------------------
-    // TODO: configure your kernel here
+    // Configuration du kernel
+    dim3 block(16, 16);
+    dim3 grid((n + 15) / 16,
+          (n + 15) / 16,
+          batch_size);
 
 
     // --------------------------------------------------------
     // Warmup run
     // --------------------------------------------------------
-    // TODO: run your kernel once (warmup - not timed)
-
-    cudaDeviceSynchronize();
-
-    // TODO: start your timing here using CUDA events
-
-    for (int r = 0; r < repeats; ++r) {
-        // TODO: run your kernel here
+     // Exécution initiale sans mesure du temps
+    batch_gemm_kernel<<<grid, block>>>(
+            n, batch_size, d_A, d_B, d_C
+    );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Kernel launch error: %s\n", cudaGetErrorString(err));
     }
 
-    // TODO: end your timing here using CUDA events
+err = cudaDeviceSynchronize();
+if (err != cudaSuccess) {
+    printf("Kernel execution error: %s\n", cudaGetErrorString(err));
+}
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(start);
+
+    for (int r = 0; r < repeats; ++r) {
+        batch_gemm_kernel<<<grid, block>>>(
+              n, batch_size, d_A, d_B, d_C
+        );
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
     float custom_ms = 0.0f;
-    // TODO: calculate the time of your kernel using 'cudaEventElapsedTime'
+    cudaEventElapsedTime(&custom_ms, start, stop);
 
     const double custom_us = custom_ms * 1000.0 / repeats;
 
 
-    // TODO: copy the output matrices to CPU in 'h_custom'
+    cudaMemcpy(
+    h_custom.data(),
+    d_C,
+    bytes,
+    cudaMemcpyDeviceToHost
+  );
+  printf("Custom result[0] = %f\n", h_custom[0]);
+  printf("CPU reference[0] = %f\n", h_ref[0]);
 
     // --------------------------------------------------------
     // cuBLAS strided batched GEMM
     // --------------------------------------------------------
 
-    // TODO: create a cuBLAS handle
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
 
-    // TODO: warmup run for 'cublasSgemmStridedBatched'
-    // TODO: note that the leading dimension for all matrices is 'n'
-
+    cublasSgemmStridedBatched(
+        handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        n, n, n,
+        &alpha,
+        d_A, n, (long long)matrix_size,
+        d_B, n, (long long)matrix_size,
+        &beta,
+        d_C, n, (long long)matrix_size,
+        batch_size
+    );
+    if (status != CUBLAS_STATUS_SUCCESS) {
+    printf("cuBLAS error: %d\n", (int)status);
+    }
     cudaDeviceSynchronize();
 
-    // TODO: start timing using CUDA events
+    cudaEventRecord(start);
     for (int r = 0; r < repeats; ++r) {
 
-        // TODO: call 'cublasSgemmStridedBatched'
+       cublasSgemmStridedBatched(
+            handle,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            n, n, n,
+            &alpha,
+            d_A, n, (long long)matrix_size,
+            d_B, n, (long long)matrix_size,
+            &beta,
+            d_C, n, (long long)matrix_size,
+            batch_size
+     );
     }
 
-    // TODO: end timing using CUDA events
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
     float cublas_ms = 0.0f;
-    // TODO: calculate the time of 'cublasSgemmStridedBatched' using 'cudaEventElapsedTime'
+   cudaEventElapsedTime(&cublas_ms, start, stop);
+    if (time_err != cudaSuccess) {
+        printf("Timing error: %s\n", cudaGetErrorString(time_err));
+    }
 
+printf("Custom total time (ms): %.6f\n", custom_ms);
     const double cublas_us = cublas_ms * 1000.0 / repeats;
 
-    // TODO: copy the output matrices to CPU in 'h_cublas'
+    cudaMemcpy(
+    h_cublas.data(),
+    d_C,
+    bytes,
+    cudaMemcpyDeviceToHost
+    );
 
     // --------------------------------------------------------
     // Performance and forward error
@@ -281,11 +383,14 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     // Cleanup
     // --------------------------------------------------------
-    // TODO: Destroy any CUDA events you created
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
-    // TODO: Destroy any cuBLAS handles you created
+    cublasDestroy(handle);
 
-    // TODO: free any GPU memory you allocated
+   cudaFree(d_A);
+   cudaFree(d_B);
+   cudaFree(d_C);
 
     return 0;
 }
